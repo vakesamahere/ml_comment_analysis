@@ -1,7 +1,16 @@
 import pandas as pd
-import json
+import csv
 import re
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from tqdm import tqdm
+import time
 from python_openai_messager.llm import send_llm_chat_request
+
+# 全局锁，用于线程安全的文件写入
+file_lock = Lock()
 
 def load_sentiment_prompt():
     """
@@ -31,21 +40,17 @@ def analyze_comment_sentiment(comment_text, prompt_template):
     
     # 替换模板中的占位符
     prompt = prompt_template.replace('{raw_review_text}', comment_text)
-    
+    # print(comment_text, 'start')
     try:
         # 发送请求给大模型
         response = send_llm_chat_request(
             prompt=prompt,
             stream=False      # 不需要流式输出
         )
-        # print("请求提示词\n==============")
-        # print(prompt)
-        # print("==============")
-        # print(response)
         
         # 解析返回结果，提取 (需求, 情感) 元组
         result_tuple = parse_sentiment_result(response)
-        
+        # print(comment_text, 'done')
         # 返回包含原始响应和解析结果的字典
         return {
             "parsed_result": result_tuple,
@@ -84,46 +89,68 @@ def parse_sentiment_result(response_text):
     print(f"咪啾~无法解析大模型返回结果: {response_text} (｡•́︿•̀｡)")
     return None
 
-def batch_analyze_comments(csv_file_path, output_file_path=None,length=-1):
+def load_processed_reply_ids(output_file_path):
     """
-    批量分析评论数据喵~
-    
-    参数:
-    - csv_file_path: 输入CSV文件路径
-    - output_file_path: 输出结果文件路径（可选）
-    
-    返回:
-    - list: 分析结果列表
+    加载已处理的reply_id，避免重复处理喵~
     """
-    print("喵呜~开始批量分析评论啦！ฅ^•ﻌ•^ฅ")
+    processed_ids = set()
+    if os.path.exists(output_file_path):
+        try:
+            df = pd.read_csv(output_file_path, encoding='utf-8')
+            if 'reply_id' in df.columns:
+                processed_ids = set(df['reply_id'].astype(str))
+            print(f"喵呜~发现已处理的评论 {len(processed_ids)} 条！继续上次的工作 ฅ^•ﻌ•^ฅ")
+        except Exception as e:
+            print(f"咪啾~读取历史结果文件出错: {str(e)} (´･ω･`)")
+    return processed_ids
+
+def save_batch_results_to_csv(results_batch, output_file_path):
+    """
+    批量保存结果到CSV文件（追加模式）喵~
+    """
+    if not results_batch:
+        return
     
-    # 加载提示词模板
-    prompt_template = load_sentiment_prompt()
-    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
-    if not prompt_template:
-        return []
+    with file_lock:
+        # 检查文件是否存在，决定是否写入表头
+        file_exists = os.path.exists(output_file_path)
+        
+        try:
+            with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'llm_raw_response']
+                deletions = []
+                for result in results_batch:
+                    if result['requirement'] is None and result['sentiment'] is None:
+                        deletions.append(result)
+                        continue
+                    result['requirement'] = str(result['requirement']).replace('\n', ' ').replace('\r', ' ')
+                    result['sentiment'] = str(result['sentiment']).replace('\n', ' ').replace('\r', ' ')
+                    result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                results_batch = [result for result in results_batch if result not in deletions]
+                # 如果文件不存在，写入表头
+                if not file_exists:
+                    writer.writeheader()
+                
+                # 写入数据
+                for result in results_batch:
+                    writer.writerow(result)
+                    
+        except Exception as e:
+            print(f"咪啾~保存CSV文件失败: {str(e)} (´･ω･`)")
+
+def process_comment_batch(batch_data, prompt_template, output_file_path, bar=None):
+    """
+    处理一批评论数据喵~
+    """
+    results_batch = []
     
-    # 读取CSV数据
-    try:
-        df = pd.read_csv(csv_file_path, encoding='utf-8')
-        print(f"成功读取 {len(df)} 条评论数据喵~ (≧∇≦)ﾉ")
-        if length > 0:
-            df = df.head(length)
-            print(f"将分析前 {length} 条评论喵~ (≧▽≦)")
-    except Exception as e:
-        print(f"咪啾~读取CSV文件失败: {str(e)} (´･ω･`)")
-        return []
-    
-    results = []
-    
-    # 逐条分析评论
-    for index, row in df.iterrows():
+    for _, row in batch_data.iterrows():
+        reply_id = str(row.get('reply_id', ''))
         comment_content = str(row.get('content', '')).strip()
         
         if not comment_content or comment_content == 'nan':
             continue
-        
-        print(f"分析第 {index + 1} 条评论中...喵~ ")
         
         # 分析情感
         sentiment_result = analyze_comment_sentiment(comment_content, prompt_template)
@@ -138,37 +165,113 @@ def batch_analyze_comments(csv_file_path, output_file_path=None,length=-1):
         
         # 保存结果
         result = {
-            'global_id': row.get('global_id', ''),
+            'reply_id': reply_id,
             'content': comment_content,
-            'sentiment_analysis': parsed_tuple,
             'requirement': parsed_tuple[0] if parsed_tuple else None,
             'sentiment': parsed_tuple[1] if parsed_tuple else None,
-            'llm_raw_response': raw_response  # 新增：保存LLM原始响应
+            'llm_raw_response': raw_response
         }
-        results.append(result)
-        
-        # 简单的进度显示
-        if (index + 1) % 10 == 0:
-            print(f"已完成 {index + 1} 条评论分析喵~ ヽ(=^･ω･^=)丿")
+        results_batch.append(result)
     
-    print(f"批量分析完成！共处理 {len(results)} 条评论喵~ (ΦωΦ)")
+    # 批量保存到CSV
+    save_batch_results_to_csv(results_batch, output_file_path)
+    # 更新进度条
+    if bar and len(results_batch) == 1:
+        bar.write(f"==============================")
+        bar.write(f"\t评论内容: {comment_content}")
     
-    # 保存结果到文件
-    if output_file_path:
-        save_results_to_file(results, output_file_path)
-    
-    return results
+    return len(results_batch)
 
-def save_results_to_file(results, output_file_path):
+def batch_analyze_comments_threaded(csv_file_path, output_file_path=None, length=-1, batch_size=1, max_workers=25, cooldown=2):
     """
-    保存分析结果到文件喵~
+    多线程批量分析评论数据喵~
+    
+    参数:
+    - csv_file_path: 输入CSV文件路径
+    - output_file_path: 输出CSV文件路径
+    - length: 处理的评论数量限制
+    - batch_size: 每批处理的评论数量
+    - max_workers: 最大工作线程数（根据每分钟2000的限制设置）
     """
+    print("喵呜~多线程评论分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    
+    # 加载提示词模板
+    prompt_template = load_sentiment_prompt()
+    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
+    if not prompt_template:
+        return []
+    
+    # 设置输出文件路径
+    if not output_file_path:
+        output_file_path = 'results/sentiment_analysis_results.csv'
+    
+    # 创建输出目录
+    os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+    
+    # 加载已处理的reply_id
+    processed_ids = load_processed_reply_ids(output_file_path)
+    
+    # 读取CSV数据
     try:
-        with open(output_file_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"结果已保存到 {output_file_path} 喵~ ✧(≖ ◡ ≖✿)")
+        df = pd.read_csv(csv_file_path, encoding='utf-8')
+        print(f"成功读取 {len(df)} 条评论数据喵~ (≧∇≦)ﾉ")
+        
+        # 过滤已处理的数据
+        df = df[~df['reply_id'].astype(str).isin(processed_ids)]
+        print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
+        
+        if length > 0:
+            df = df.head(length)
+            print(f"将分析前 {length} 条评论喵~ (≧▽≦)")
+            
     except Exception as e:
-        print(f"咪啾~保存文件失败: {str(e)} (´･ω･`)")
+        print(f"咪啾~读取CSV文件失败: {str(e)} (´･ω･`)")
+        return []
+    
+    if df.empty:
+        print("咪啾~没有新的评论需要处理呢！(´･ω･`)")
+        return []
+    
+    # 分批处理
+    total_batches = len(df) // batch_size + (1 if len(df) % batch_size > 0 else 0)
+    batches = []
+    
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i+batch_size]
+        batches.append(batch)
+    
+    print(f"将使用 {max_workers} 个线程处理 {total_batches} 个批次喵~ ✧(≖ ◡ ≖✿)")
+    
+    # 多线程处理
+    processed_count = 0
+
+    bar = tqdm(total=len(df), desc="处理评论中", unit="条")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_batch = {}
+        for batch in batches:
+            future = executor.submit(process_comment_batch, batch, prompt_template, output_file_path, bar)
+            future_to_batch[future] = batch
+        
+        # 使用tqdm显示进度
+        with bar as pbar:
+            for future in as_completed(future_to_batch):
+                try:
+                    batch_processed_count = future.result()
+                    processed_count += batch_processed_count
+                    pbar.update(batch_processed_count)
+                    
+                    # 简单的速率控制，避免超过API限制
+                    time.sleep(cooldown)
+                    
+                except Exception as e:
+                    print(f"咪啾~处理批次时出错: {str(e)} (´･ω･`)")
+    
+    print(f"批量分析完成！共处理 {processed_count} 条评论喵~ (ΦωΦ)")
+    print(f"结果已保存到 {output_file_path} 喵~ ✧(≖ ◡ ≖✿)")
+    
+    return processed_count
 
 def demo_single_analysis():
     """
@@ -179,6 +282,8 @@ def demo_single_analysis():
     prompt_template = load_sentiment_prompt()
     if not prompt_template:
         return
+    
+    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
     
     # 示例评论
     test_comments = [
@@ -201,16 +306,19 @@ def demo_single_analysis():
         print("-" * 50)
 
 if __name__ == "__main__":
-    print("喵呜~汽车评论情感分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    print("喵呜~多线程汽车评论情感分析系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 演示单条分析
     # demo_single_analysis()
     
-    # 批量分析评论
-    results = batch_analyze_comments(
+    # 多线程批量分析评论
+    processed_count = batch_analyze_comments_threaded(
         csv_file_path='data/comment_contents_cleaned.csv',
-        output_file_path='results/sentiment_analysis_results.json',
-        length = 5,
+        output_file_path='results/sentiment_analysis_results.csv',
+        length=100,  # 测试用，处理100条
+        batch_size=1,  # 每批n条
+        max_workers=30,  # 最大n个线程，控制并发
+        cooldown = 1  # 每条评论处理后等待0.1秒，确保 max_workers * 60 <= cooldown * 2000
     )
     
-    print("\n任务完成喵~尾巴高速摇摆中！ヽ(=^･ω･^=)丿")
+    print(f"\n任务完成喵~处理了 {processed_count} 条评论！尾巴高速摇摆中！ヽ(=^･ω･^=)丿")
