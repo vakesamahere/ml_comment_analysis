@@ -1,0 +1,57 @@
+[
+  {
+    "global_id": 2830510108537016320,
+    "content": "啥价",
+    "sentiment_analysis": [
+      "价格",
+      "中性"
+    ],
+    "requirement": "价格",
+    "sentiment": "中性",
+    "llm_raw_response": "('价格', '中性')"
+  },
+  {
+    "global_id": 2830510108537016320,
+    "content": "健康度真不错，现在用LG的三元锂肯定不如之前的松下",
+    "sentiment_analysis": [
+      "电池性能",
+      "消极"
+    ],
+    "requirement": "电池性能",
+    "sentiment": "消极",
+    "llm_raw_response": "('电池性能', '消极')"
+  },
+  {
+    "global_id": 2829364175828963328,
+    "content": "Y总感觉颠，所以我也选了3，车一年也带不了几次人，越买越小了",
+    "sentiment_analysis": [
+      "车内空间",
+      "消极"
+    ],
+    "requirement": "车内空间",
+    "sentiment": "消极",
+    "llm_raw_response": "('车内空间', '消极')"
+  },
+  {
+    "global_id": 2829364175828963328,
+    "content": "看了下第一年保险，还是有点小贵",
+    "sentiment_analysis": [
+      "保险",
+      "消极"
+    ],
+    "requirement": "保险",
+    "sentiment": "消极",
+    "llm_raw_response": "('保险', '消极')"
+  },
+  {
+    "global_id": 2701778874705924096,
+    "content": "落地多少？",
+    "sentiment_analysis": [
+      "价格",
+      "中性"
+    ],
+    "requirement": "价格",
+    "sentiment": "中性",
+    "llm_raw_response": "('价格', '中性')"
+  }
+]
