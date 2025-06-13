@@ -2,15 +2,19 @@ import pandas as pd
 import csv
 import re
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from tqdm import tqdm
-import time
+import asyncio
+from tqdm.asyncio import tqdm as async_tqdm
 from python_openai_messager.llm import send_llm_chat_request
 
-# 全局锁，用于线程安全的文件写入
-file_lock = Lock()
+# 全局变量
+import aiofiles
+import time
+from datetime import timedelta
+
+# 初始化全局计数器
+failure_count = 0   # 失败次数
+total_processed = 0 # 已处理总数
+total_time = 0     # 总处理时间
 
 def load_sentiment_prompt():
     """
@@ -24,9 +28,9 @@ def load_sentiment_prompt():
         print("咪啾~找不到提示词文件呢！(´･ω･`)")
         return None
 
-def analyze_comment_sentiment(comment_text, prompt_template):
+async def analyze_comment_sentiment(comment_text, prompt_template):
     """
-    分析单条评论的情感倾向和需求喵~
+    分析单条评论的情感倾向和需求喵~（异步版本）
     
     参数:
     - comment_text: 用户评论文本
@@ -40,17 +44,22 @@ def analyze_comment_sentiment(comment_text, prompt_template):
     
     # 替换模板中的占位符
     prompt = prompt_template.replace('{raw_review_text}', comment_text)
-    # print(comment_text, 'start')
     try:
         # 发送请求给大模型
-        response = send_llm_chat_request(
+        response = await send_llm_chat_request(
             prompt=prompt,
             stream=False      # 不需要流式输出
         )
-        
+        if response.startswith("[error]"):
+            raise ValueError(f"大模型请求失败: {response}")
+    except Exception as e:
+        print(f"咪啾~分析评论时出错啦: {str(e)} (´･ω･`)")
+        return None
+    
+    try:
         # 解析返回结果，提取 (需求, 情感) 元组
         result_tuple = parse_sentiment_result(response)
-        # print(comment_text, 'done')
+        
         # 返回包含原始响应和解析结果的字典
         return {
             "parsed_result": result_tuple,
@@ -58,8 +67,11 @@ def analyze_comment_sentiment(comment_text, prompt_template):
         }
         
     except Exception as e:
-        print(f"咪啾~分析评论时出错啦: {str(e)} (´･ω･`)")
-        return None
+        # print(f"咪啾~分析评论时出错啦: {str(e)} (´･ω･`)")
+        return {
+            "parsed_result": ('无关', '中性'),
+            "raw_response": response
+        }
 
 def parse_sentiment_result(response_text):
     """
@@ -86,7 +98,8 @@ def parse_sentiment_result(response_text):
         sentiment = match2.group(2).strip()
         return (requirement, sentiment)
     
-    print(f"咪啾~无法解析大模型返回结果: {response_text} (｡•́︿•̀｡)")
+    # print(f"咪啾~无法解析大模型返回结果: {response_text} (｡•́︿•̀｡)")
+    return ('无关', '中性')  # 默认返回无关和中性
     return None
 
 def load_processed_reply_ids(output_file_path):
@@ -104,44 +117,51 @@ def load_processed_reply_ids(output_file_path):
             print(f"咪啾~读取历史结果文件出错: {str(e)} (´･ω･`)")
     return processed_ids
 
-def save_batch_results_to_csv(results_batch, output_file_path):
+async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
     """
-    批量保存结果到CSV文件（追加模式）喵~
+    批量保存结果到CSV文件（追加模式）喵~（异步版本）
     """
+    global failure_count
+    
     if not results_batch:
         return
     
-    with file_lock:
-        # 检查文件是否存在，决定是否写入表头
-        file_exists = os.path.exists(output_file_path)
+    # 检查文件是否存在，决定是否写入表头
+    file_exists = os.path.exists(output_file_path)
+    
+    try:
+        # 处理要写入的数据
+        deletions = []
+        for result in results_batch:
+            if result['requirement'] is None and result['sentiment'] is None:
+                deletions.append(result)
+                failure_count += 1
+                if pbar:
+                    pbar.set_postfix({'失败': failure_count}, refresh=True)
+                continue
+            result['requirement'] = str(result['requirement']).replace('\n', ' ').replace('\r', ' ')
+            result['sentiment'] = str(result['sentiment']).replace('\n', ' ').replace('\r', ' ')
+            result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
         
-        try:
-            with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'llm_raw_response']
-                deletions = []
-                for result in results_batch:
-                    if result['requirement'] is None and result['sentiment'] is None:
-                        deletions.append(result)
-                        continue
-                    result['requirement'] = str(result['requirement']).replace('\n', ' ').replace('\r', ' ')
-                    result['sentiment'] = str(result['sentiment']).replace('\n', ' ').replace('\r', ' ')
-                    result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                results_batch = [result for result in results_batch if result not in deletions]
-                # 如果文件不存在，写入表头
-                if not file_exists:
-                    writer.writeheader()
+        results_batch = [result for result in results_batch if result not in deletions]
+        
+        # 使用标准csv模块写入
+        with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'llm_raw_response']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            if not file_exists:
+                writer.writeheader()
+            
+            for result in results_batch:
+                writer.writerow(result)
                 
-                # 写入数据
-                for result in results_batch:
-                    writer.writerow(result)
-                    
-        except Exception as e:
-            print(f"咪啾~保存CSV文件失败: {str(e)} (´･ω･`)")
+    except Exception as e:
+        print(f"咪啾~保存CSV文件失败: {str(e)} (´･ω･`)")
 
-def process_comment_batch(batch_data, prompt_template, output_file_path, bar=None):
+async def process_comment_batch(batch_data, prompt_template, output_file_path, pbar=None):
     """
-    处理一批评论数据喵~
+    处理一批评论数据喵~（异步版本）
     """
     results_batch = []
     
@@ -153,7 +173,7 @@ def process_comment_batch(batch_data, prompt_template, output_file_path, bar=Non
             continue
         
         # 分析情感
-        sentiment_result = analyze_comment_sentiment(comment_content, prompt_template)
+        sentiment_result = await analyze_comment_sentiment(comment_content, prompt_template)
         
         # 提取解析结果和原始响应
         if sentiment_result:
@@ -173,27 +193,23 @@ def process_comment_batch(batch_data, prompt_template, output_file_path, bar=Non
         }
         results_batch.append(result)
     
-    # 批量保存到CSV
-    save_batch_results_to_csv(results_batch, output_file_path)
-    # 更新进度条
-    if bar and len(results_batch) == 1:
-        bar.write(f"==============================")
-        bar.write(f"\t评论内容: {comment_content}")
+    # 批量保存到CSV（传递进度条）
+    await save_batch_results_to_csv(results_batch, output_file_path, pbar)
     
     return len(results_batch)
 
-def batch_analyze_comments_threaded(csv_file_path, output_file_path=None, length=-1, batch_size=1, max_workers=25, cooldown=2):
+async def batch_analyze_comments_async(csv_file_path, output_file_path=None, length=-1, batch_size=1, max_concurrent=25, cooldown=2):
     """
-    多线程批量分析评论数据喵~
+    异步批量分析评论数据喵~
     
     参数:
     - csv_file_path: 输入CSV文件路径
     - output_file_path: 输出CSV文件路径
     - length: 处理的评论数量限制
     - batch_size: 每批处理的评论数量
-    - max_workers: 最大工作线程数（根据每分钟2000的限制设置）
+    - max_concurrent: 最大并发数（根据每分钟2000的限制设置）
     """
-    print("喵呜~多线程评论分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    print("喵呜~异步评论分析系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 加载提示词模板
     prompt_template = load_sentiment_prompt()
@@ -240,35 +256,76 @@ def batch_analyze_comments_threaded(csv_file_path, output_file_path=None, length
         batch = df.iloc[i:i+batch_size]
         batches.append(batch)
     
-    print(f"将使用 {max_workers} 个线程处理 {total_batches} 个批次喵~ ✧(≖ ◡ ≖✿)")
+    print(f"将使用最大并发数 {max_concurrent} 处理 {total_batches} 个批次喵~ ✧(≖ ◡ ≖✿)")
     
-    # 多线程处理
+    # 使用信号量控制并发
+    semaphore = asyncio.Semaphore(max_concurrent)
     processed_count = 0
-
-    bar = tqdm(total=len(df), desc="处理评论中", unit="条")
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_batch = {}
-        for batch in batches:
-            future = executor.submit(process_comment_batch, batch, prompt_template, output_file_path, bar)
-            future_to_batch[future] = batch
+    # 创建进度条
+    pbar = async_tqdm(total=len(df), desc="处理评论中", unit="条")
+    
+    async def process_with_semaphore(batch):
+        global total_processed, total_time
         
-        # 使用tqdm显示进度
-        with bar as pbar:
-            for future in as_completed(future_to_batch):
-                try:
-                    batch_processed_count = future.result()
-                    processed_count += batch_processed_count
-                    pbar.update(batch_processed_count)
-                    
-                    # 简单的速率控制，避免超过API限制
-                    time.sleep(cooldown)
-                    
-                except Exception as e:
-                    print(f"咪啾~处理批次时出错: {str(e)} (´･ω･`)")
+        async with semaphore:
+            batch_start_time = asyncio.get_event_loop().time()
+            result = await process_comment_batch(batch, prompt_template, output_file_path, pbar)
+            
+            # 计算处理时间（不包含cooldown）
+            # process_time = asyncio.get_event_loop().time() - batch_start_time
+            # total_time += process_time
+            total_time = time.time() - start_time  # 更新总时间
+            total_processed += len(batch)
+            
+            # 计算平均速度（条/分钟）
+            avg_speed = (total_processed / total_time) if total_time > 0 else 0
+            
+            # 计算预计剩余时间
+            remaining_items = len(df) - total_processed
+            eta = (remaining_items / avg_speed) if avg_speed > 0 else 0
+            eta_str = str(timedelta(seconds=int(eta))) if eta > 0 else "计算中..."
+            
+            # 计算失败率
+            failure_rate = (failure_count / total_processed * 100) if total_processed > 0 else 0
+            
+            # 更新进度条信息
+            pbar.set_postfix({
+                '平均速度': f'{avg_speed:.1f}条/秒',
+                '剩余时间': eta_str,
+                '失败率': f'{failure_rate:.1f}%',
+                '失败数量': failure_count
+            }, refresh=True)
+            
+            # 更新进度条
+            pbar.update(len(batch))
+            
+            # 控制请求速率
+            time_taken = asyncio.get_event_loop().time() - batch_start_time
+            need_cooldown = max(0, cooldown - time_taken)
+            await asyncio.sleep(need_cooldown)
+            
+            return result
+    
+    # 创建所有任务
+    tasks = [process_with_semaphore(batch) for batch in batches]
+    
+    # 使用gather执行所有任务
+    results = await asyncio.gather(*tasks)
+    processed_count = sum(results)
+    
+    # 关闭进度条（不需要await）
+    pbar.close()
+    
+    # 计算总体统计信息
+    total_time_mins = total_time / 60
+    avg_speed = (processed_count / total_time) * 60 if total_time > 0 else 0
+    failure_rate = (failure_count / processed_count * 100) if processed_count > 0 else 0
     
     print(f"批量分析完成！共处理 {processed_count} 条评论喵~ (ΦωΦ)")
+    print(f"总用时: {total_time_mins:.1f}分钟")
+    print(f"平均速度: {avg_speed:.1f}条/分钟")
+    print(f"失败数: {failure_count} 条 (失败率: {failure_rate:.1f}%) (｡•́︿•̀｡)")
     print(f"结果已保存到 {output_file_path} 喵~ ✧(≖ ◡ ≖✿)")
     
     return processed_count
@@ -306,19 +363,23 @@ def demo_single_analysis():
         print("-" * 50)
 
 if __name__ == "__main__":
-    print("喵呜~多线程汽车评论情感分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    global start_time  # 声明要使用全局变量
+    print("喵呜~异步汽车评论情感分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    
+    # 记录启动时间
+    start_time = time.time()
     
     # 演示单条分析
     # demo_single_analysis()
     
-    # 多线程批量分析评论
-    processed_count = batch_analyze_comments_threaded(
+    # 异步批量分析评论
+    asyncio.run(batch_analyze_comments_async(
         csv_file_path='data/comment_contents_cleaned.csv',
         output_file_path='results/sentiment_analysis_results.csv',
-        length=100,  # 测试用，处理100条
-        batch_size=1,  # 每批n条
-        max_workers=30,  # 最大n个线程，控制并发
-        cooldown = 1  # 每条评论处理后等待0.1秒，确保 max_workers * 60 <= cooldown * 2000
-    )
+        # length=100,  # 测试用，处理100条
+        batch_size=1,  # 每批x条
+        max_concurrent=16,  # 最大并发数，控制并发: 20
+        cooldown=2  # 每条评论处理后等待z秒: 12
+    ))
     
-    print(f"\n任务完成喵~处理了 {processed_count} 条评论！尾巴高速摇摆中！ヽ(=^･ω･^=)丿")
+    print("\n任务完成喵~尾巴高速摇摆中！ヽ(=^･ω･^=)丿")

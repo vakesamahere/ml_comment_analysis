@@ -2,3 +2,6 @@
 *__pycache__
 data/*
 *.csv
+*.old
+*.bak
+*.log

@@ -5,7 +5,7 @@
 用于验证系统功能是否正常工作喵~
 """
 
-from main import load_sentiment_prompt, analyze_comment_sentiment, parse_sentiment_result
+from tuple_notation import load_sentiment_prompt, analyze_comment_sentiment, parse_sentiment_result
 
 def test_prompt_loading():
     """测试提示词加载功能"""
