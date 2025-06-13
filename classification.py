@@ -16,34 +16,35 @@ failure_count = 0   # 失败次数
 total_processed = 0 # 已处理总数
 total_time = 0     # 总处理时间
 
-def load_sentiment_prompt():
+def load_classification_prompt():
     """
-    加载情感分析提示词模板喵~
+    加载分类提示词模板喵~
     """
     try:
-        with open('prompts/report_sentiment_tuple.txt', 'r', encoding='utf-8') as f:
+        with open('prompts/classification.txt', 'r', encoding='utf-8') as f:
             prompt_template = f.read()
         return prompt_template
     except FileNotFoundError:
         print("咪啾~找不到提示词文件呢！(´･ω･`)")
         return None
 
-async def analyze_comment_sentiment(comment_text, prompt_template):
+async def classify_need(customer_need, prompt_template):
     """
-    分析单条评论的情感倾向和需求喵~（异步版本）
+    分析单个需求的分类喵~（异步版本）
     
     参数:
-    - comment_text: 用户评论文本
+    - customer_need: 用户需求文本
     - prompt_template: 提示词模板
     
     返回:
-    - dict: {"parsed_result": (需求, 情感), "raw_response": "原始回复"} 或 None（如果解析失败）
+    - dict: {"parsed_result": "分类结果", "raw_response": "原始回复"} 或 None（如果解析失败）
     """
-    if not comment_text or not prompt_template:
+    if not customer_need or not prompt_template:
         return None
     
     # 替换模板中的占位符
-    prompt = prompt_template.replace('{raw_review_text}', comment_text)
+    prompt = prompt_template.replace('{customer_need}', customer_need)
+    
     try:
         # 发送请求给大模型
         response = await send_llm_chat_request(
@@ -53,69 +54,24 @@ async def analyze_comment_sentiment(comment_text, prompt_template):
         if response.startswith("[error]"):
             raise ValueError(f"大模型请求失败: {response}")
     except Exception as e:
-        print(f"咪啾~分析评论时出错啦: {str(e)} (´･ω･`)")
+        print(f"咪啾~分析需求时出错啦: {str(e)} (´･ω･`)")
         return None
     
     try:
-        # 解析返回结果，提取 (需求, 情感) 元组
-        result_tuple = parse_sentiment_result(response)
+        # 解析返回结果
+        result = response.strip()
         
         # 返回包含原始响应和解析结果的字典
         return {
-            "parsed_result": result_tuple,
+            "parsed_result": result,
             "raw_response": response
         }
         
     except Exception as e:
-        # print(f"咪啾~分析评论时出错啦: {str(e)} (´･ω･`)")
         return {
-            "parsed_result": ('无关', '中性'),
+            "parsed_result": "其他",
             "raw_response": response
         }
-
-def parse_sentiment_result(response_text):
-    """
-    解析大模型返回的结果，提取(需求, 情感)元组喵~
-    """
-    if not response_text:
-        return None
-    
-    # 尝试匹配 ('需求', '情感') 格式
-    pattern = r"\('([^']+)',\s*'([^']+)'\)"
-    match = re.search(pattern, response_text)
-    
-    if match:
-        requirement = match.group(1).strip()
-        sentiment = match.group(2).strip()
-        return (requirement, sentiment)
-    
-    # 如果第一种格式不匹配，尝试其他可能的格式
-    pattern2 = r'\("([^"]+)",\s*"([^"]+)"\)'
-    match2 = re.search(pattern2, response_text)
-    
-    if match2:
-        requirement = match2.group(1).strip()
-        sentiment = match2.group(2).strip()
-        return (requirement, sentiment)
-    
-    # print(f"咪啾~无法解析大模型返回结果: {response_text} (｡•́︿•̀｡)")
-    return ('无关', '中性')  # 默认返回无关和中性
-    return None
-
-def load_processed_reply_ids(output_file_path):
-    """
-    加载已处理的reply_id，避免重复处理喵~
-    """
-    processed_ids = set()
-    if os.path.exists(output_file_path):
-        try:
-            df = pd.read_csv(output_file_path, encoding='utf-8')
-            if 'reply_id' in df.columns:
-                processed_ids = set(df['reply_id'].astype(str))
-            print(f"喵呜~发现已处理的评论 {len(processed_ids)} 条！继续上次的工作 ฅ^•ﻌ•^ฅ")
-        except Exception as e:
-            print(f"咪啾~读取历史结果文件出错: {str(e)} (´･ω･`)")
-    return processed_ids
 
 async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
     """
@@ -133,21 +89,20 @@ async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
         # 处理要写入的数据
         deletions = []
         for result in results_batch:
-            if result['requirement'] is None and result['sentiment'] is None:
+            if result['classification'] is None:
                 deletions.append(result)
                 failure_count += 1
                 if pbar:
                     pbar.set_postfix({'失败': failure_count}, refresh=True)
                 continue
-            result['requirement'] = str(result['requirement']).replace('\n', ' ').replace('\r', ' ')
-            result['sentiment'] = str(result['sentiment']).replace('\n', ' ').replace('\r', ' ')
+            result['classification'] = str(result['classification']).replace('\n', ' ').replace('\r', ' ')
             result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
         
         results_batch = [result for result in results_batch if result not in deletions]
         
         # 使用标准csv模块写入
         with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'llm_raw_response']
+            fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'classification', 'llm_raw_response']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             if not file_exists:
@@ -167,28 +122,31 @@ async def process_comment_batch(batch_data, prompt_template, output_file_path, p
     
     for _, row in batch_data.iterrows():
         reply_id = str(row.get('reply_id', ''))
-        comment_content = str(row.get('content', '')).strip()
+        content = str(row.get('content', '')).strip()
+        requirement = str(row.get('requirement', '')).strip()
+        sentiment = str(row.get('sentiment', '')).strip()
         
-        if not comment_content or comment_content == 'nan':
+        if not requirement or requirement == 'nan':
             continue
         
-        # 分析情感
-        sentiment_result = await analyze_comment_sentiment(comment_content, prompt_template)
+        # 分类分析
+        classification_result = await classify_need(requirement, prompt_template)
         
         # 提取解析结果和原始响应
-        if sentiment_result:
-            parsed_tuple = sentiment_result.get("parsed_result")
-            raw_response = sentiment_result.get("raw_response", "")
+        if classification_result:
+            parsed_result = classification_result.get("parsed_result")
+            raw_response = classification_result.get("raw_response", "")
         else:
-            parsed_tuple = None
+            parsed_result = None
             raw_response = ""
         
         # 保存结果
         result = {
             'reply_id': reply_id,
-            'content': comment_content,
-            'requirement': parsed_tuple[0] if parsed_tuple else None,
-            'sentiment': parsed_tuple[1] if parsed_tuple else None,
+            'content': content,
+            'requirement': requirement,
+            'sentiment': sentiment,
+            'classification': parsed_result,
             'llm_raw_response': raw_response
         }
         results_batch.append(result)
@@ -207,45 +165,42 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     - output_file_path: 输出CSV文件路径
     - length: 处理的评论数量限制
     - batch_size: 每批处理的评论数量
-    - max_concurrent: 最大并发数（根据每分钟2000的限制设置）
+    - max_concurrent: 最大并发数
     """
-    print("喵呜~异步评论分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    print("喵呜~异步评论分类系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 加载提示词模板
-    prompt_template = load_sentiment_prompt()
-    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
+    prompt_template = load_classification_prompt()
     if not prompt_template:
         return []
     
     # 设置输出文件路径
     if not output_file_path:
-        output_file_path = 'results/sentiment_analysis_results.csv'
+        output_file_path = 'results/classification_results.csv'
     
     # 创建输出目录
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
     
-    # 加载已处理的reply_id
-    processed_ids = load_processed_reply_ids(output_file_path)
-    
     # 读取CSV数据
     try:
         df = pd.read_csv(csv_file_path, encoding='utf-8')
-        print(f"成功读取 {len(df)} 条评论数据喵~ (≧∇≦)ﾉ")
+        print(f"成功读取 {len(df)} 条数据喵~ (≧∇≦)ﾉ")
         
+        processed_ids = pd.read_csv(output_file_path, encoding='utf-8')['reply_id'].astype(str).tolist() if os.path.exists(output_file_path) else []
         # 过滤已处理的数据
         df = df[~df['reply_id'].astype(str).isin(processed_ids)]
         print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
         
         if length > 0:
             df = df.head(length)
-            print(f"将分析前 {length} 条评论喵~ (≧▽≦)")
+            print(f"将分析前 {length} 条数据喵~ (≧▽≦)")
             
     except Exception as e:
         print(f"咪啾~读取CSV文件失败: {str(e)} (´･ω･`)")
         return []
     
     if df.empty:
-        print("咪啾~没有新的评论需要处理呢！(´･ω･`)")
+        print("咪啾~没有数据需要处理呢！(´･ω･`)")
         return []
     
     # 分批处理
@@ -273,8 +228,6 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
             result = await process_comment_batch(batch, prompt_template, output_file_path, pbar)
             
             # 计算处理时间（不包含cooldown）
-            # process_time = asyncio.get_event_loop().time() - batch_start_time
-            # total_time += process_time
             total_time = time.time() - start_time  # 更新总时间
             total_processed += len(batch)
             
@@ -314,7 +267,7 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     results = await asyncio.gather(*tasks)
     processed_count = sum(results)
     
-    # 关闭进度条（不需要await）
+    # 关闭进度条
     pbar.close()
     
     # 计算总体统计信息
@@ -322,7 +275,7 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     avg_speed = (processed_count / total_time) * 60 if total_time > 0 else 0
     failure_rate = (failure_count / processed_count * 100) if processed_count > 0 else 0
     
-    print(f"批量分析完成！共处理 {processed_count} 条评论喵~ (ΦωΦ)")
+    print(f"批量分析完成！共处理 {processed_count} 条数据喵~ (ΦωΦ)")
     print(f"总用时: {total_time_mins:.1f}分钟")
     print(f"平均速度: {avg_speed:.1f}条/分钟")
     print(f"失败数: {failure_count} 条 (失败率: {failure_rate:.1f}%) (｡•́︿•̀｡)")
@@ -332,39 +285,37 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
 
 def demo_single_analysis():
     """
-    演示单条评论分析喵~
+    演示单条需求分类喵~
     """
-    print("=== 单条评论分析演示 ===")
+    print("=== 单条需求分类演示 ===")
     
-    prompt_template = load_sentiment_prompt()
+    prompt_template = load_classification_prompt()
     if not prompt_template:
         return
     
-    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
-    
-    # 示例评论
-    test_comments = [
-        "这辆车的加速性能真是太棒了，轻轻一点油门就能感受到推背感！",
-        "导航系统经常卡顿，路线规划也不准确，让我很困扰。",
-        "我觉得车内空间还可以，不算大但也不挤。",
-        "健康度真不错，现在用LG的三元锂肯定不如之前的松下"
+    # 示例需求
+    test_needs = [
+        "发动机动力",
+        "方向盘手感",
+        "座椅舒适度",
+        "车身设计"
     ]
     
-    for comment in test_comments:
-        print(f"\n评论: {comment}")
-        result = analyze_comment_sentiment(comment, prompt_template)
+    for need in test_needs:
+        print(f"\n需求: {need}")
+        result = classify_need(need, prompt_template)
         if result:
             parsed_result = result.get("parsed_result")
             raw_response = result.get("raw_response", "")
-            print(f"解析结果: {parsed_result}")
+            print(f"分类结果: {parsed_result}")
             print(f"LLM原始响应: {raw_response}")
         else:
-            print("分析结果: None")
+            print("分类结果: None")
         print("-" * 50)
 
 if __name__ == "__main__":
     global start_time  # 声明要使用全局变量
-    print("喵呜~异步汽车评论情感分析系统启动啦！ฅ^•ﻌ•^ฅ")
+    print("喵呜~异步需求分类系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 记录启动时间
     start_time = time.time()
@@ -374,12 +325,11 @@ if __name__ == "__main__":
     
     # 异步批量分析评论
     asyncio.run(batch_analyze_comments_async(
-        csv_file_path='data/comment_contents_cleaned.csv',
-        output_file_path='results/sentiment_analysis_results.csv',
-        # length=100,  # 测试用，处理100条
-        batch_size=1,  # 每批x条
-        max_concurrent=16,  # 最大并发数，控制并发: 20
-        cooldown=1  # 每条评论处理后等待z秒: 12
+        csv_file_path='results/sentiment_analysis_results.csv',  # 使用第一步的输出作为输入
+        output_file_path='results/classification_results.csv',
+        batch_size=1,  # 每批1条
+        max_concurrent=90,  # 最大并发数
+        cooldown=1  # 每条处理后等待
     ))
     
     print("\n任务完成喵~尾巴高速摇摆中！ヽ(=^･ω･^=)丿")

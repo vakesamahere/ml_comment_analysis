@@ -5,3 +5,6 @@ data/*
 *.old
 *.bak
 *.log
+*.png
+results/*
+test/*
