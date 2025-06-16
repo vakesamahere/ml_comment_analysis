@@ -16,16 +16,19 @@ failure_count = 0   # 失败次数
 total_processed = 0 # 已处理总数
 total_time = 0     # 总处理时间
 
-def load_classification_prompt():
+def load_classification_prompt(prompt_file='prompts/classification.txt'):
     """
     加载分类提示词模板喵~
+    
+    参数:
+    - prompt_file: 提示词文件路径
     """
     try:
-        with open('prompts/classification.txt', 'r', encoding='utf-8') as f:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
             prompt_template = f.read()
         return prompt_template
     except FileNotFoundError:
-        print("咪啾~找不到提示词文件呢！(´･ω･`)")
+        print(f"咪啾~找不到提示词文件呢！{prompt_file} (´･ω･`)")
         return None
 
 async def classify_need(customer_need, prompt_template):
@@ -73,9 +76,15 @@ async def classify_need(customer_need, prompt_template):
             "raw_response": response
         }
 
-async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
+async def save_batch_results_to_csv(results_batch, output_file_path, output_columns, pbar=None):
     """
     批量保存结果到CSV文件（追加模式）喵~（异步版本）
+    
+    参数:
+    - results_batch: 要保存的批次结果
+    - output_file_path: 输出文件路径
+    - output_columns: 输出的列名列表
+    - pbar: 进度条对象
     """
     global failure_count
     
@@ -89,21 +98,23 @@ async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
         # 处理要写入的数据
         deletions = []
         for result in results_batch:
-            if result['classification'] is None:
+            if result.get('classification') is None:
                 deletions.append(result)
                 failure_count += 1
                 if pbar:
                     pbar.set_postfix({'失败': failure_count}, refresh=True)
                 continue
-            result['classification'] = str(result['classification']).replace('\n', ' ').replace('\r', ' ')
-            result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
+                
+            # 清理数据中的换行符
+            for key in result:
+                if isinstance(result[key], str):
+                    result[key] = result[key].replace('\n', ' ').replace('\r', ' ')
         
         results_batch = [result for result in results_batch if result not in deletions]
         
         # 使用标准csv模块写入
         with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'classification', 'llm_raw_response']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer = csv.DictWriter(csvfile, fieldnames=output_columns)
             
             if not file_exists:
                 writer.writeheader()
@@ -114,15 +125,30 @@ async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
     except Exception as e:
         print(f"咪啾~保存CSV文件失败: {str(e)} (´･ω･`)")
 
-async def process_comment_batch(batch_data, prompt_template, output_file_path, pbar=None):
+async def process_comment_batch(batch_data, prompt_template, output_file_path, pbar=None, 
+                              id_column='reply_id', content_column='content', 
+                              output_columns=None):
     """
     处理一批评论数据喵~（异步版本）
+    
+    参数:
+    - batch_data: 批次数据
+    - prompt_template: 提示词模板
+    - output_file_path: 输出文件路径
+    - pbar: 进度条对象
+    - id_column: ID列的列名
+    - content_column: 内容列的列名
+    - output_columns: 输出的列名列表
     """
     results_batch = []
     
+    if output_columns is None:
+        output_columns = [id_column, content_column, 'requirement', 'sentiment', 'classification', 'llm_raw_response']
+    
     for _, row in batch_data.iterrows():
-        reply_id = str(row.get('reply_id', ''))
-        content = str(row.get('content', '')).strip()
+        # 获取ID，如果不存在则使用索引作为ID
+        item_id = str(row.get(id_column, '')) if id_column in row else str(_)
+        content = str(row.get(content_column, '')).strip()
         requirement = str(row.get('requirement', '')).strip()
         sentiment = str(row.get('sentiment', '')).strip()
         
@@ -142,21 +168,30 @@ async def process_comment_batch(batch_data, prompt_template, output_file_path, p
         
         # 保存结果
         result = {
-            'reply_id': reply_id,
-            'content': content,
+            id_column: item_id,
+            content_column: content,
             'requirement': requirement,
             'sentiment': sentiment,
             'classification': parsed_result,
             'llm_raw_response': raw_response
         }
+        
+        # 添加原始数据中的其他列
+        for col in row.index:
+            if col not in [id_column, content_column, 'requirement', 'sentiment'] and col not in result:
+                result[col] = row[col]
+                
         results_batch.append(result)
     
     # 批量保存到CSV（传递进度条）
-    await save_batch_results_to_csv(results_batch, output_file_path, pbar)
+    await save_batch_results_to_csv(results_batch, output_file_path, output_columns, pbar)
     
     return len(results_batch)
 
-async def batch_analyze_comments_async(csv_file_path, output_file_path=None, length=-1, batch_size=1, max_concurrent=25, cooldown=2):
+async def batch_analyze_comments_async(csv_file_path, output_file_path=None, length=-1, batch_size=1, 
+                                     max_concurrent=25, cooldown=2, id_column='reply_id', 
+                                     content_column='content', extra_columns=None, 
+                                     prompt_file=None, auto_include_columns=True,**config):
     """
     异步批量分析评论数据喵~
     
@@ -166,11 +201,17 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     - length: 处理的评论数量限制
     - batch_size: 每批处理的评论数量
     - max_concurrent: 最大并发数
+    - cooldown: 每条处理后的冷却时间（秒）
+    - id_column: ID列的列名
+    - content_column: 内容列的列名
+    - extra_columns: 需要保留的额外列名列表
+    - prompt_file: 自定义提示词文件路径
+    - auto_include_columns: 是否自动包含所有原始数据列
     """
     print("喵呜~异步评论分类系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 加载提示词模板
-    prompt_template = load_classification_prompt()
+    prompt_template = load_classification_prompt(prompt_file) if prompt_file else load_classification_prompt()
     if not prompt_template:
         return []
     
@@ -181,26 +222,64 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     # 创建输出目录
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
     
+    # 确定要保留的列
+    if extra_columns is None:
+        extra_columns = []
+        
     # 读取CSV数据
     try:
         df = pd.read_csv(csv_file_path, encoding='utf-8')
         print(f"成功读取 {len(df)} 条数据喵~ (≧∇≦)ﾉ")
         
-        processed_ids = pd.read_csv(output_file_path, encoding='utf-8')['reply_id'].astype(str).tolist() if os.path.exists(output_file_path) else []
+        # 确保必要的列存在
+        required_cols = [id_column, content_column, 'requirement', 'sentiment']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"咪啾~找不到必要的列: {', '.join(missing_cols)}! (´･ω･`)")
+            if 'requirement' in missing_cols or 'sentiment' in missing_cols:
+                print("缺少必要的需求和情感列，无法进行分类分析(｡•́︿•̀｡)")
+                return []
+            
+        # 如果ID列不存在，创建一个索引作为ID列
+        if id_column not in df.columns:
+            print(f"找不到ID列 '{id_column}'，将使用索引作为ID喵~")
+            df[id_column] = df.index.astype(str)
+        
+        # 自动包含所有列作为输出列
+        if auto_include_columns:
+            for col in df.columns:
+                if col not in [id_column, content_column, 'requirement', 'sentiment'] and col not in extra_columns:
+                    extra_columns.append(col)
+            print(f"自动包含了 {len(extra_columns)} 个额外列喵~ ✧(≖ ◡ ≖✿)")
+    
+        output_columns = [id_column, content_column, 'requirement', 'sentiment', 'classification', 'llm_raw_response'] + extra_columns
+        
+        # 获取已处理的ID
+        processed_ids = set()
+        if os.path.exists(output_file_path):
+            try:
+                processed_df = pd.read_csv(output_file_path, encoding='utf-8')
+                if id_column in processed_df.columns:
+                    processed_ids = set(processed_df[id_column].astype(str))
+                print(f"喵呜~发现已处理的评论 {len(processed_ids)} 条！继续上次的工作 ฅ^•ﻌ•^ฅ")
+            except Exception as e:
+                print(f"咪啾~读取历史结果文件出错: {str(e)} (´･ω･`)")
+        
         # 过滤已处理的数据
-        df = df[~df['reply_id'].astype(str).isin(processed_ids)]
-        print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
+        if processed_ids:
+            df = df[~df[id_column].astype(str).isin(processed_ids)]
+            print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
         
         if length > 0:
             df = df.head(length)
-            print(f"将分析前 {length} 条数据喵~ (≧▽≦)")
+            print(f"将分析前 {length} 条评论喵~ (≧▽≦)")
             
     except Exception as e:
         print(f"咪啾~读取CSV文件失败: {str(e)} (´･ω･`)")
         return []
     
     if df.empty:
-        print("咪啾~没有数据需要处理呢！(´･ω･`)")
+        print("咪啾~没有新的评论需要处理呢！(´･ω･`)")
         return []
     
     # 分批处理
@@ -225,9 +304,12 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
         
         async with semaphore:
             batch_start_time = asyncio.get_event_loop().time()
-            result = await process_comment_batch(batch, prompt_template, output_file_path, pbar)
+            result = await process_comment_batch(
+                batch, prompt_template, output_file_path, pbar, 
+                id_column, content_column, output_columns
+            )
             
-            # 计算处理时间（不包含cooldown）
+            # 更新计时器
             total_time = time.time() - start_time  # 更新总时间
             total_processed += len(batch)
             
@@ -313,6 +395,27 @@ def demo_single_analysis():
             print("分类结果: None")
         print("-" * 50)
 
+def clear_illegal_types(**config):
+    """
+    清理DataFrame中指定列的非法类型喵~
+    
+    参数:
+    - df: 要处理的DataFrame
+    - columns: 要清理的列名列表
+    """
+    df = pd.read_csv(config.get('output_file_path', ''), encoding='utf-8')
+    classification_types = config.get('classification_types', [])
+    output_path = config.get('output_file_path', 'results/classification_results.csv')
+    for index, row in df.iterrows():
+        classification = row.get('classification', '')
+        if isinstance(classification, str):
+            # 使用正则表达式匹配合法类型
+            if not classification in classification_types:
+                print(f"清理非法类型: {classification} 在索引 {index} 处被标记为无关喵~")
+                df.at[index, 'classification'] = '无关'
+                # input()
+    df.to_csv(output_path, index=False, encoding='utf-8')
+
 if __name__ == "__main__":
     global start_time  # 声明要使用全局变量
     print("喵呜~异步需求分类系统启动啦！ฅ^•ﻌ•^ฅ")
@@ -320,16 +423,31 @@ if __name__ == "__main__":
     # 记录启动时间
     start_time = time.time()
     
+    # 自定义配置
+    config = {
+        'csv_file_path': 'case_study/mtr/results/MTR_demand_tuple.csv',  # 使用第一步的输出作为输入
+        'output_file_path': 'case_study/mtr/results/MTR_demand_tuple_classified.csv',   # 分类结果输出路径
+        'length': -1,          # -1表示处理所有评论
+        'batch_size': 1,       # 每批x条
+        'max_concurrent': 90,  # 最大并发数
+        'cooldown': 1,         # 每条评论处理后等待z秒
+        'id_column': 'id',      # ID列的列名
+        'content_column': 'Content',  # 内容列的列名
+        'extra_columns': [],   # 手动指定需要保留的额外列
+        'prompt_file': 'case_study/mtr/prompts/classification.txt',   # 自定义提示词文件，None表示使用默认
+        'auto_include_columns': False,  # 自动包含所有原始列
+        'classification_types': ["等待时间","APP","产品体验","营销活动","环境氛围","服务体验","卫生情况","地理位置"]
+    }
+    
     # 演示单条分析
     # demo_single_analysis()
     
     # 异步批量分析评论
-    asyncio.run(batch_analyze_comments_async(
-        csv_file_path='results/sentiment_analysis_results.csv',  # 使用第一步的输出作为输入
-        output_file_path='results/classification_results.csv',
-        batch_size=1,  # 每批1条
-        max_concurrent=90,  # 最大并发数
-        cooldown=1  # 每条处理后等待
-    ))
+    asyncio.run(batch_analyze_comments_async(**config))
     
     print("\n任务完成喵~尾巴高速摇摆中！ヽ(=^･ω･^=)丿")
+
+    if 1:
+        # 清理非法类型
+        clear_illegal_types(**config)
+        print("清理非法类型完成喵~ (≧∇≦)ﾉ")

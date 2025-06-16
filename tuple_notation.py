@@ -16,16 +16,19 @@ failure_count = 0   # 失败次数
 total_processed = 0 # 已处理总数
 total_time = 0     # 总处理时间
 
-def load_sentiment_prompt():
+def load_sentiment_prompt(prompt_file='prompts/report_sentiment_tuple.txt'):
     """
     加载情感分析提示词模板喵~
+    
+    参数:
+    - prompt_file: 提示词文件路径
     """
     try:
-        with open('prompts/report_sentiment_tuple.txt', 'r', encoding='utf-8') as f:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
             prompt_template = f.read()
         return prompt_template
     except FileNotFoundError:
-        print("咪啾~找不到提示词文件呢！(´･ω･`)")
+        print(f"咪啾~找不到提示词文件呢！{prompt_file} (´･ω･`)")
         return None
 
 async def analyze_comment_sentiment(comment_text, prompt_template):
@@ -100,26 +103,35 @@ def parse_sentiment_result(response_text):
     
     # print(f"咪啾~无法解析大模型返回结果: {response_text} (｡•́︿•̀｡)")
     return ('无关', '中性')  # 默认返回无关和中性
-    return None
 
-def load_processed_reply_ids(output_file_path):
+def load_processed_ids(output_file_path, id_column='reply_id'):
     """
-    加载已处理的reply_id，避免重复处理喵~
+    加载已处理的ID，避免重复处理喵~
+    
+    参数:
+    - output_file_path: 输出文件路径
+    - id_column: ID列的列名
     """
     processed_ids = set()
     if os.path.exists(output_file_path):
         try:
             df = pd.read_csv(output_file_path, encoding='utf-8')
-            if 'reply_id' in df.columns:
-                processed_ids = set(df['reply_id'].astype(str))
+            if id_column in df.columns:
+                processed_ids = set(df[id_column].astype(str))
             print(f"喵呜~发现已处理的评论 {len(processed_ids)} 条！继续上次的工作 ฅ^•ﻌ•^ฅ")
         except Exception as e:
             print(f"咪啾~读取历史结果文件出错: {str(e)} (´･ω･`)")
     return processed_ids
 
-async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
+async def save_batch_results_to_csv(results_batch, output_file_path, output_columns, pbar=None):
     """
     批量保存结果到CSV文件（追加模式）喵~（异步版本）
+    
+    参数:
+    - results_batch: 要保存的批次结果
+    - output_file_path: 输出文件路径
+    - output_columns: 输出的列名列表
+    - pbar: 进度条对象
     """
     global failure_count
     
@@ -133,22 +145,23 @@ async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
         # 处理要写入的数据
         deletions = []
         for result in results_batch:
-            if result['requirement'] is None and result['sentiment'] is None:
+            if result.get('requirement') is None and result.get('sentiment') is None:
                 deletions.append(result)
                 failure_count += 1
                 if pbar:
                     pbar.set_postfix({'失败': failure_count}, refresh=True)
                 continue
-            result['requirement'] = str(result['requirement']).replace('\n', ' ').replace('\r', ' ')
-            result['sentiment'] = str(result['sentiment']).replace('\n', ' ').replace('\r', ' ')
-            result['llm_raw_response'] = str(result['llm_raw_response']).replace('\n', ' ').replace('\r', ' ')
+                
+            # 清理数据中的换行符
+            for key in result:
+                if isinstance(result[key], str):
+                    result[key] = result[key].replace('\n', ' ').replace('\r', ' ')
         
         results_batch = [result for result in results_batch if result not in deletions]
         
         # 使用标准csv模块写入
         with open(output_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['reply_id', 'content', 'requirement', 'sentiment', 'llm_raw_response']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer = csv.DictWriter(csvfile, fieldnames=output_columns)
             
             if not file_exists:
                 writer.writeheader()
@@ -159,15 +172,30 @@ async def save_batch_results_to_csv(results_batch, output_file_path, pbar=None):
     except Exception as e:
         print(f"咪啾~保存CSV文件失败: {str(e)} (´･ω･`)")
 
-async def process_comment_batch(batch_data, prompt_template, output_file_path, pbar=None):
+async def process_comment_batch(batch_data, prompt_template, output_file_path, pbar=None, 
+                              id_column='reply_id', content_column='content', 
+                              output_columns=None):
     """
     处理一批评论数据喵~（异步版本）
+    
+    参数:
+    - batch_data: 批次数据
+    - prompt_template: 提示词模板
+    - output_file_path: 输出文件路径
+    - pbar: 进度条对象
+    - id_column: ID列的列名
+    - content_column: 内容列的列名
+    - output_columns: 输出的列名列表
     """
     results_batch = []
     
+    if output_columns is None:
+        output_columns = [id_column, content_column, 'requirement', 'sentiment', 'llm_raw_response']
+    
     for _, row in batch_data.iterrows():
-        reply_id = str(row.get('reply_id', ''))
-        comment_content = str(row.get('content', '')).strip()
+        # 获取ID，如果不存在则使用索引作为ID
+        item_id = str(row.get(id_column, '')) if id_column in row else str(_)
+        comment_content = str(row.get(content_column, '')).strip()
         
         if not comment_content or comment_content == 'nan':
             continue
@@ -185,20 +213,29 @@ async def process_comment_batch(batch_data, prompt_template, output_file_path, p
         
         # 保存结果
         result = {
-            'reply_id': reply_id,
-            'content': comment_content,
+            id_column: item_id,
+            content_column: comment_content,
             'requirement': parsed_tuple[0] if parsed_tuple else None,
             'sentiment': parsed_tuple[1] if parsed_tuple else None,
             'llm_raw_response': raw_response
         }
+        
+        # 添加原始数据中的其他列
+        for col in row.index:
+            if col not in [id_column, content_column] and col not in result:
+                result[col] = row[col]
+                
         results_batch.append(result)
     
     # 批量保存到CSV（传递进度条）
-    await save_batch_results_to_csv(results_batch, output_file_path, pbar)
+    await save_batch_results_to_csv(results_batch, output_file_path, output_columns, pbar)
     
     return len(results_batch)
 
-async def batch_analyze_comments_async(csv_file_path, output_file_path=None, length=-1, batch_size=1, max_concurrent=25, cooldown=2):
+async def batch_analyze_comments_async(csv_file_path, output_file_path=None, length=-1, batch_size=1, 
+                                     max_concurrent=25, cooldown=2, product_name='产品',
+                                     id_column='reply_id', content_column='content', 
+                                     extra_columns=None, prompt_file=None):
     """
     异步批量分析评论数据喵~
     
@@ -207,15 +244,22 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     - output_file_path: 输出CSV文件路径
     - length: 处理的评论数量限制
     - batch_size: 每批处理的评论数量
-    - max_concurrent: 最大并发数（根据每分钟2000的限制设置）
+    - max_concurrent: 最大并发数
+    - cooldown: 每条处理后的冷却时间（秒）
+    - product_name: 产品名称，用于替换提示词中的占位符
+    - id_column: ID列的列名
+    - content_column: 内容列的列名
+    - extra_columns: 需要保留的额外列名列表
+    - prompt_file: 自定义提示词文件路径
     """
     print("喵呜~异步评论分析系统启动啦！ฅ^•ﻌ•^ฅ")
     
     # 加载提示词模板
-    prompt_template = load_sentiment_prompt()
-    prompt_template = prompt_template.replace('{product_name}', '特斯拉Model3')
+    prompt_template = load_sentiment_prompt(prompt_file) if prompt_file else load_sentiment_prompt()
     if not prompt_template:
         return []
+    
+    prompt_template = prompt_template.replace('{product_name}', product_name)
     
     # 设置输出文件路径
     if not output_file_path:
@@ -224,17 +268,36 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
     # 创建输出目录
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
     
-    # 加载已处理的reply_id
-    processed_ids = load_processed_reply_ids(output_file_path)
+    # 确定要保留的列
+    if extra_columns is None:
+        extra_columns = []
+    
+    output_columns = [id_column, content_column, 'requirement', 'sentiment', 'llm_raw_response'] + extra_columns
+    
+    # 加载已处理的ID
+    processed_ids = load_processed_ids(output_file_path, id_column)
     
     # 读取CSV数据
     try:
         df = pd.read_csv(csv_file_path, encoding='utf-8')
         print(f"成功读取 {len(df)} 条评论数据喵~ (≧∇≦)ﾉ")
         
+        # 确保必要的列存在
+        if content_column not in df.columns:
+            print(f"咪啾~找不到内容列 '{content_column}'! (´･ω･`)")
+            return []
+            
+        # 如果ID列不存在，创建一个索引作为ID列
+        if id_column not in df.columns:
+            print(f"找不到ID列 '{id_column}'，将使用索引作为ID喵~")
+            df[id_column] = df.index.astype(str)
+
+        df = df[[id_column, content_column] + extra_columns] if extra_columns else df[[id_column, content_column]]
+        
         # 过滤已处理的数据
-        df = df[~df['reply_id'].astype(str).isin(processed_ids)]
-        print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
+        if len(processed_ids) > 0:
+            df = df[~df[id_column].astype(str).isin(processed_ids)]
+            print(f"过滤后待处理 {len(df)} 条评论喵~ (≧▽≦)")
         
         if length > 0:
             df = df.head(length)
@@ -270,11 +333,12 @@ async def batch_analyze_comments_async(csv_file_path, output_file_path=None, len
         
         async with semaphore:
             batch_start_time = asyncio.get_event_loop().time()
-            result = await process_comment_batch(batch, prompt_template, output_file_path, pbar)
+            result = await process_comment_batch(
+                batch, prompt_template, output_file_path, pbar, 
+                id_column, content_column, output_columns
+            )
             
-            # 计算处理时间（不包含cooldown）
-            # process_time = asyncio.get_event_loop().time() - batch_start_time
-            # total_time += process_time
+            # 更新计时器
             total_time = time.time() - start_time  # 更新总时间
             total_processed += len(batch)
             
@@ -369,17 +433,25 @@ if __name__ == "__main__":
     # 记录启动时间
     start_time = time.time()
     
+    # 自定义配置
+    config = {
+        'csv_file_path': 'case_study/mtr/data/MTR.csv',
+        'output_file_path': 'case_study/mtr/results/MTR_demand_tuple.csv',
+        'length': -1,  # -1表示处理所有评论
+        'batch_size': 1,  # 每批x条
+        'max_concurrent': 90,  # 最大并发数
+        'cooldown': 1,  # 每条评论处理后等待z秒
+        'product_name': '麦当劳',  # 服务名称
+        'id_column': 'id',  # ID列的列名
+        'content_column': 'Content',  # 内容列的列名
+        'extra_columns': [],  # 需要保留的额外列
+        'prompt_file': 'case_study/mtr/prompts/tuple_generation.txt'  # 自定义提示词文件，None表示使用默认
+    }
+    
     # 演示单条分析
     # demo_single_analysis()
     
     # 异步批量分析评论
-    asyncio.run(batch_analyze_comments_async(
-        csv_file_path='data/comment_contents_cleaned.csv',
-        output_file_path='results/sentiment_analysis_results.csv',
-        # length=100,  # 测试用，处理100条
-        batch_size=1,  # 每批x条
-        max_concurrent=16,  # 最大并发数，控制并发: 20
-        cooldown=1  # 每条评论处理后等待z秒: 12
-    ))
+    asyncio.run(batch_analyze_comments_async(**config))
     
     print("\n任务完成喵~尾巴高速摇摆中！ヽ(=^･ω･^=)丿")
