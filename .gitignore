@@ -8,3 +8,5 @@ data/*
 *.png
 results/*
 test/*
+*/tests/*
+*.xlsx
