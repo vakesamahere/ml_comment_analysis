@@ -63,6 +63,7 @@ def clear_illegal_types(**config)
 ### 安装依赖
 ```bash
 pip install -r python_openai_messager/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 配置环境
